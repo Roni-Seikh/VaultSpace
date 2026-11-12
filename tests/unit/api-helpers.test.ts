@@ -3,8 +3,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { ApiError, mapDbError, throwDb } from "@/lib/api/errors";
 import { rateLimit, resetRateLimits } from "@/lib/api/rate-limit";
 import { hashIp } from "@/lib/api/handler";
-import { presignDownload, presignUpload } from "@/lib/r2/client";
-import { S3Client } from "@aws-sdk/client-s3";
+import { vi } from "vitest";
+vi.mock("server-only", () => ({}));
+import { copyObject, deleteObjects, headObjectSize, presignDownload, presignUpload, type StorageApi } from "@/lib/r2/client";
 
 describe("DB error mapping", () => {
   it("maps known SQL exceptions to friendly HTTP errors", () => {
@@ -47,29 +48,54 @@ describe("IP hashing", () => {
   });
 });
 
-describe("R2 presigned URLs (signed locally, no network)", () => {
-  const client = new S3Client({
-    region: "auto",
-    forcePathStyle: true,
-    endpoint: "https://acct.r2.cloudflarestorage.com",
-    credentials: { accessKeyId: "AKIATESTTESTTEST", secretAccessKey: "secret" },
-    requestChecksumCalculation: "WHEN_REQUIRED",
-  });
+describe("storage client (fake Supabase Storage API, no network)", () => {
+  const ok = <T,>(data: T) => Promise.resolve({ data, error: null });
+  function fake(over: Partial<StorageApi> = {}): StorageApi & { calls: string[] } {
+    const calls: string[] = [];
+    return {
+      calls,
+      createSignedUploadUrl: async (p) => { calls.push(`up:${p}`); return { data: { signedUrl: `https://x.supabase.co/storage/v1/object/upload/sign/b/${p}?token=t` }, error: null }; },
+      createSignedUrl: async (p, ttl, o) => { calls.push(`dl:${p}:${ttl}:${o?.download}`); return { data: { signedUrl: "https://x/dl" }, error: null }; },
+      info: async () => ok({ size: 1234 }),
+      copy: async (a, b) => { calls.push(`cp:${a}>${b}`); return { error: null }; },
+      remove: async (k) => { calls.push(`rm:${k.length}`); return { data: null, error: null }; },
+      ...over,
+    };
+  }
 
-  it("upload URL is short-lived, targets the key, and signs content-length", async () => {
-    const url = new URL(await presignUpload("u/abc/def/v1-xyz", 1234, client, "my-bucket"));
-    expect(url.host).toBe("acct.r2.cloudflarestorage.com");
-    expect(url.pathname).toBe("/my-bucket/u/abc/def/v1-xyz");
-    expect(url.searchParams.get("X-Amz-Expires")).toBe("300");
-    expect(url.searchParams.get("X-Amz-SignedHeaders")).toContain("content-length");
-    expect(url.searchParams.get("X-Amz-Signature")).toMatch(/^[0-9a-f]{64}$/);
-    expect(url.toString()).not.toContain("secret");
+  it("upload URL targets the key", async () => {
+    const f = fake();
+    expect(await presignUpload("u/a/b/v1-x", f)).toContain("/u/a/b/v1-x?token=");
   });
-
-  it("download URL expires in 60s and forces attachment + opaque content type", async () => {
-    const url = new URL(await presignDownload("u/abc/def/v1-xyz", client, "my-bucket"));
-    expect(url.searchParams.get("X-Amz-Expires")).toBe("60");
-    expect(url.searchParams.get("response-content-disposition")).toBe("attachment");
-    expect(url.searchParams.get("response-content-type")).toBe("application/octet-stream");
+  it("download URL lives 60 s and forces download", async () => {
+    const f = fake();
+    await presignDownload("k", f);
+    expect(f.calls).toContain("dl:k:60:true");
+  });
+  it("reports object size, and null when the object does not exist", async () => {
+    expect(await headObjectSize("k", fake())).toBe(1234);
+    const missing = fake({ info: async () => ({ data: null, error: { message: "Object not found", statusCode: "404" } }) });
+    expect(await headObjectSize("k", missing)).toBeNull();
+    const broken = fake({ info: async () => ({ data: null, error: { message: "boom" } }) });
+    await expect(headObjectSize("k", broken)).rejects.toThrow(/boom/);
+  });
+  it("copies and surfaces errors", async () => {
+    const f = fake();
+    await copyObject("a", "b", f);
+    expect(f.calls).toContain("cp:a>b");
+    await expect(copyObject("a", "b", fake({ copy: async () => ({ error: { message: "nope" } }) }))).rejects.toThrow(/nope/);
+  });
+  it("deletes in batches of 100 and returns keys that failed", async () => {
+    const f = fake();
+    const keys = Array.from({ length: 250 }, (_, i) => `k${i}`);
+    expect(await deleteObjects(keys, f)).toEqual([]);
+    expect(f.calls.filter((c) => c.startsWith("rm:"))).toEqual(["rm:100", "rm:100", "rm:50"]);
+    const failing = fake({ remove: async () => ({ data: null, error: { message: "x" } }) });
+    expect(await deleteObjects(["a", "b"], failing)).toEqual(["a", "b"]);
+    expect(await deleteObjects([], f)).toEqual([]);
+  });
+  it("signing failure throws", async () => {
+    const bad = fake({ createSignedUploadUrl: async () => ({ data: null, error: { message: "denied" } }) });
+    await expect(presignUpload("k", bad)).rejects.toThrow(/denied/);
   });
 });
